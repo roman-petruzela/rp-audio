@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# rp-audio — unified audio output control for RPRice.
+#
+#   rp-audio switch <sink>   switch the default output (name or index)
+#   rp-audio cycle           switch to the next output in order
+#   rp-audio volume up|down|set <0-100>
+#   rp-audio mute [on|off|toggle]
+#   rp-audio unpin           release all streams back to the default output
+#   rp-audio sync            match the volume of all outputs to the default one
+#   rp-audio list            list outputs (JSON)
+#   rp-audio daemon          watch volume and new streams (systemd unit)
+#
+# Volume is always set on ALL outputs at once, so switching between them
+# isn't heard as a jump. Streams from the blacklist (~/.config/rp-audio/blacklist.conf)
+# stay wherever the app itself routed them.
+
+set -uo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rp-audio"
+BLACKLIST_FILE="$CONF_DIR/blacklist.conf"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/rp-audio"
+VOL_STATE="$STATE_DIR/volume"
+MUTE_STATE="$STATE_DIR/mute"
+APPLY_LOCK="$STATE_DIR/applying"
+
+MAX_VOL=65536                    # 100%
+STEP=$(( MAX_VOL * 2 / 100 ))    # 2% step
+
+DEFAULT_BLACKLIST=(obs easyeffects)
+
+mkdir -p "$STATE_DIR"
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+sink_ids()   { pactl list short sinks 2>/dev/null | awk '{print $1}'; }
+sink_names() { pactl list short sinks 2>/dev/null | awk '{print $2}'; }
+
+raw_of()  { pactl get-sink-volume "$1" 2>/dev/null | awk 'NR==1{print $3; exit}'; }
+mute_of() { pactl get-sink-mute   "$1" 2>/dev/null | awk 'NR==1{print $2; exit}'; }
+
+pct_of_raw() { awk -v r="${1:-0}" -v m="$MAX_VOL" 'BEGIN{printf "%d", (r*100/m)+0.5}'; }
+
+global_vol()  { cat "$VOL_STATE"  2>/dev/null || raw_of  @DEFAULT_SINK@; }
+global_mute() { cat "$MUTE_STATE" 2>/dev/null || mute_of @DEFAULT_SINK@; }
+
+read_blacklist() {
+    if [[ -r "$BLACKLIST_FILE" ]]; then
+        sed 's/#.*//' "$BLACKLIST_FILE"
+    else
+        printf '%s\n' "${DEFAULT_BLACKLIST[@]}"
+    fi | tr -d ' \t' | tr '[:upper:]' '[:lower:]' | grep -v '^$'
+}
+
+# The OSD reads the value from PipeWire itself — `qs ipc call` in 0.3.0
+# can't pass an argument.
+osd() {
+    command -v qs >/dev/null 2>&1 || return 0
+    qs ipc call osd-volume trigger >/dev/null 2>&1 || true
+}
+
+# ── writing to all outputs ─────────────────────────────────────────────
+# APPLY_LOCK keeps the daemon quiet while our own batch of writes is in flight.
+
+set_all_raw() {
+    local raw="$1" id
+    (( raw < 0 )) && raw=0
+    (( raw > MAX_VOL )) && raw=$MAX_VOL
+    : > "$APPLY_LOCK"
+    for id in $(sink_ids); do
+        pactl set-sink-volume "$id" "$raw" 2>/dev/null || true
+    done
+    echo "$raw" > "$VOL_STATE"
+    sleep 0.15
+    rm -f "$APPLY_LOCK"
+}
+
+set_all_mute() {
+    local state="$1" id flag
+    [[ "$state" == "yes" ]] && flag=1 || flag=0
+    : > "$APPLY_LOCK"
+    for id in $(sink_ids); do
+        pactl set-sink-mute "$id" "$flag" 2>/dev/null || true
+    done
+    echo "$state" > "$MUTE_STATE"
+    sleep 0.15
+    rm -f "$APPLY_LOCK"
+}
+
+# ── releasing streams ───────────────────────────────────────────────────
+# Clears the stream's explicit target, so WirePlumber sends it to the
+# default output and keeps it following the default output from then on.
+
+unpin_streams() {
+    local bl ids
+    bl=$(read_blacklist | jq -R . | jq -s .) || return 0
+
+    ids=$(pw-dump 2>/dev/null | jq -r --argjson bl "$bl" '
+        [ .[]
+          | select(.type == "PipeWire:Interface:Node")
+          | select(.info.props."media.class" == "Stream/Output/Audio")
+          | { id: .id,
+              tag: ( ( (.info.props."application.process.binary" // "") + "|"
+                     + (.info.props."application.name"           // "") + "|"
+                     + (.info.props."node.name"                  // "") )
+                     | ascii_downcase ) }
+        ]
+        | map(select( .tag as $t | ( $bl | map(select($t | contains(.))) | length ) == 0 ))
+        | .[].id
+    ' 2>/dev/null) || return 0
+
+    local nid
+    for nid in $ids; do
+        pw-metadata -n default "$nid" target.object -1 Spa:Id >/dev/null 2>&1 || true
+        pw-metadata -n default "$nid" target.node   -1 Spa:Id >/dev/null 2>&1 || true
+    done
+}
+
+# ── commands ───────────────────────────────────────────────────────────
+
+cmd_switch() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || { echo "rp-audio: missing output" >&2; return 1; }
+    pactl set-default-sink "$target" 2>/dev/null || return 1
+    unpin_streams
+    set_all_raw "$(global_vol)"
+    set_all_mute "$(global_mute)"
+}
+
+cmd_cycle() {
+    local current next idx=0 i
+    current=$(pactl get-default-sink 2>/dev/null) || return 1
+    mapfile -t sinks < <(sink_names)
+    (( ${#sinks[@]} <= 1 )) && return 0
+    for i in "${!sinks[@]}"; do
+        [[ "${sinks[$i]}" == "$current" ]] && { idx=$i; break; }
+    done
+    next="${sinks[$(( (idx + 1) % ${#sinks[@]} ))]}"
+    cmd_switch "$next"
+    osd
+}
+
+cmd_volume() {
+    local action="${1:-up}" cur new
+    cur=$(global_vol)
+    case "$action" in
+        up)   new=$(( cur + STEP )) ;;
+        down) new=$(( cur - STEP )) ;;
+        set)  new=$(( MAX_VOL * ${2:-0} / 100 )) ;;
+        *)    echo "rp-audio: unknown argument '$action'" >&2; return 1 ;;
+    esac
+    set_all_raw "$new"
+    osd
+}
+
+cmd_mute() {
+    local action="${1:-toggle}" new
+    case "$action" in
+        on)     new=yes ;;
+        off)    new=no ;;
+        toggle) [[ "$(global_mute)" == "yes" ]] && new=no || new=yes ;;
+        *)      echo "rp-audio: unknown argument '$action'" >&2; return 1 ;;
+    esac
+    set_all_mute "$new"
+    osd
+}
+
+cmd_sync() {
+    set_all_raw  "$(raw_of  @DEFAULT_SINK@)"
+    set_all_mute "$(mute_of @DEFAULT_SINK@)"
+}
+
+cmd_list() {
+    local default; default=$(pactl get-default-sink 2>/dev/null)
+    pw-dump 2>/dev/null | jq --arg def "$default" '
+        [ .[]
+          | select(.type == "PipeWire:Interface:Node")
+          | select(.info.props."media.class" == "Audio/Sink")
+          | { id:          .id,
+              name:        .info.props."node.name",
+              description: (.info.props."node.description" // .info.props."node.name"),
+              active:      (.info.props."node.name" == $def) }
+        ]'
+}
+
+# ── daemon ───────────────────────────────────────────────────────────────
+
+# A freshly added device generates `change` events for a moment while it
+# catches up with its stored values — typically at full volume. Without
+# this quarantine, the daemon would treat that startup as a manual change
+# and stretch 100% volume onto everything.
+SETTLE_SECS=4
+SETTLE_DIR="$STATE_DIR/settling"
+
+mark_settling() { mkdir -p "$SETTLE_DIR"; : > "$SETTLE_DIR/$1"; }
+
+is_settling() {
+    local f="$SETTLE_DIR/$1" mtime
+    [[ -e "$f" ]] || return 1
+    mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if (( $(date +%s) - mtime > SETTLE_SECS )); then
+        rm -f "$f"
+        return 1
+    fi
+    return 0
+}
+
+apply_global_to() {
+    local id="$1" flag
+    [[ "$(global_mute)" == "yes" ]] && flag=1 || flag=0
+    pactl set-sink-volume "$id" "$(global_vol)" 2>/dev/null || true
+    pactl set-sink-mute   "$id" "$flag"         2>/dev/null || true
+}
+
+cmd_daemon() {
+    rm -rf "$SETTLE_DIR"; mkdir -p "$SETTLE_DIR"
+
+    # Initial sync based on the currently selected default output.
+    echo "$(raw_of  @DEFAULT_SINK@)" > "$VOL_STATE"
+    echo "$(mute_of @DEFAULT_SINK@)" > "$MUTE_STATE"
+    set_all_raw  "$(global_vol)"
+    set_all_mute "$(global_mute)"
+    unpin_streams
+
+    local _ ev kind id raw mute
+    pactl subscribe 2>/dev/null | while read -r _ ev _ kind id; do
+        ev=${ev//\'/}
+        id=${id#\#}
+        [[ -e "$APPLY_LOCK" ]] && continue
+
+        case "$kind" in
+            sink)
+                case "$ev" in
+                    new)
+                        mark_settling "$id"
+                        apply_global_to "$id"
+                        ;;
+                    change)
+                        # While a device is settling in, its values aren't
+                        # adopted — it's just forced to match the shared ones.
+                        if is_settling "$id"; then
+                            apply_global_to "$id"
+                            continue
+                        fi
+                        raw=$(raw_of "$id")
+                        mute=$(mute_of "$id")
+                        [[ -n "$raw"  && "$raw"  != "$(global_vol)"  ]] && set_all_raw  "$raw"
+                        [[ -n "$mute" && "$mute" != "$(global_mute)" ]] && set_all_mute "$mute"
+                        ;;
+                    remove)
+                        rm -f "$SETTLE_DIR/$id"
+                        ;;
+                esac
+                ;;
+            sink-input)
+                # A new stream must not stay stuck on another device.
+                [[ "$ev" == "new" ]] && unpin_streams
+                ;;
+        esac
+    done
+}
+
+# ── dispatcher ───────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    switch) shift; cmd_switch "$@" ;;
+    cycle)  cmd_cycle ;;
+    volume) shift; cmd_volume "$@" ;;
+    mute)   shift; cmd_mute "$@" ;;
+    unpin)  unpin_streams ;;
+    sync)   cmd_sync ;;
+    list)   cmd_list ;;
+    daemon) cmd_daemon ;;
+    *)      sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 1 ;;
+esac
