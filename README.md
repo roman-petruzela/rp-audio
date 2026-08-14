@@ -30,27 +30,38 @@ routed them (e.g. OBS monitoring, EasyEffects).
 ## Install
 
 ```bash
-mkdir -p ~/.local/bin ~/.config/rp-audio ~/.config/wireplumber/wireplumber.conf.d ~/.config/systemd/user
+./install.sh              # installs files and enables the systemd service
+./install.sh --no-enable  # installs files only, service left disabled
+```
 
-cp bin/rp-audio ~/.local/bin/rp-audio
-chmod +x ~/.local/bin/rp-audio
+Re-running `install.sh` is safe — it never overwrites an existing
+`~/.config/rp-audio/blacklist.conf` or `rp-audio.conf`. To remove everything:
 
-cp config/blacklist.conf ~/.config/rp-audio/blacklist.conf
-cp wireplumber.conf.d/51-rp-audio.conf ~/.config/wireplumber/wireplumber.conf.d/51-rp-audio.conf
-
-cp systemd/rp-audio.service ~/.config/systemd/user/rp-audio.service
-systemctl --user daemon-reload
-systemctl --user enable --now rp-audio.service
+```bash
+./uninstall.sh          # keeps ~/.config/rp-audio
+./uninstall.sh --purge  # also removes ~/.config/rp-audio
 ```
 
 The WirePlumber snippet sets `node.stream.restore-target = false` and
 `linking.follow-default-target = true`, so new streams always start on the
-default output and already-running ones follow it when it changes.
+default output and already-running ones follow it when it changes. It's
+installed as `51-rp-audio.conf` — WirePlumber's own bundled config uses
+prefixes `≤ 50`, so `51+` is the conventional range for user overrides that
+should apply after them.
 
 ## Config
 
-`config/blacklist.conf` — one pattern per line, matched as a case-insensitive
+Both files live in `~/.config/rp-audio/` and are only copied there once by
+`install.sh` — edit them in place afterwards, they won't be touched again.
+
+`blacklist.conf` — one pattern per line, matched as a case-insensitive
 substring against a stream's `application.process.binary`,
 `application.name` and `node.name`. Matching streams are never touched by
 output switching (capture streams, e.g. screen-share/OBS capture, are never
 touched regardless of the blacklist).
+
+`rp-audio.conf` — shell-sourced settings: `VOLUME_STEP_PCT` (step size for
+`volume up|down`), `OSD_CMD` (command triggered after a volume/mute change,
+e.g. for [quickshell](https://quickshell.outfoxxed.me/); empty disables it),
+and `SETTLE_SECS` (daemon quarantine window for freshly added outputs). See
+the comments in `config/rp-audio.conf` for defaults.
