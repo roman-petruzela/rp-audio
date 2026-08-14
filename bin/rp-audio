@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rp-audio — unified audio output control for RPRice.
+# rp-audio — unified audio output control for PipeWire/WirePlumber.
 #
 #   rp-audio switch <sink>   switch the default output (name or index)
 #   rp-audio cycle           switch to the next output in order
@@ -18,13 +18,22 @@ set -uo pipefail
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rp-audio"
 BLACKLIST_FILE="$CONF_DIR/blacklist.conf"
+RP_CONF_FILE="$CONF_DIR/rp-audio.conf"
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/rp-audio"
 VOL_STATE="$STATE_DIR/volume"
 MUTE_STATE="$STATE_DIR/mute"
 APPLY_LOCK="$STATE_DIR/applying"
 
-MAX_VOL=65536                    # 100%
-STEP=$(( MAX_VOL * 2 / 100 ))    # 2% step
+# Defaults — override any of these in $RP_CONF_FILE.
+VOLUME_STEP_PCT=2                          # % of full scale per volume up/down
+OSD_CMD="qs ipc call osd-volume trigger"   # run after volume/mute changes; empty disables
+SETTLE_SECS=4                              # daemon: seconds a freshly added device is quarantined
+
+# shellcheck disable=SC1090
+[[ -r "$RP_CONF_FILE" ]] && source "$RP_CONF_FILE"
+
+MAX_VOL=65536                                    # 100%
+STEP=$(( MAX_VOL * VOLUME_STEP_PCT / 100 ))
 
 DEFAULT_BLACKLIST=(obs easyeffects)
 
@@ -51,11 +60,12 @@ read_blacklist() {
     fi | tr -d ' \t' | tr '[:upper:]' '[:lower:]' | grep -v '^$'
 }
 
-# The OSD reads the value from PipeWire itself — `qs ipc call` in 0.3.0
-# can't pass an argument.
+# The OSD reads the value from PipeWire itself, so all it needs is a trigger.
+# Set OSD_CMD in $RP_CONF_FILE (or empty it) to use something other than quickshell.
 osd() {
-    command -v qs >/dev/null 2>&1 || return 0
-    qs ipc call osd-volume trigger >/dev/null 2>&1 || true
+    [[ -n "$OSD_CMD" ]] || return 0
+    command -v "${OSD_CMD%% *}" >/dev/null 2>&1 || return 0
+    $OSD_CMD >/dev/null 2>&1 || true
 }
 
 # ── writing to all outputs ─────────────────────────────────────────────
@@ -188,7 +198,6 @@ cmd_list() {
 # catches up with its stored values — typically at full volume. Without
 # this quarantine, the daemon would treat that startup as a manual change
 # and stretch 100% volume onto everything.
-SETTLE_SECS=4
 SETTLE_DIR="$STATE_DIR/settling"
 
 mark_settling() { mkdir -p "$SETTLE_DIR"; : > "$SETTLE_DIR/$1"; }
