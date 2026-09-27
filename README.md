@@ -18,6 +18,22 @@ rp-audio list            list outputs (JSON)
 rp-audio daemon          watch volume and new streams (systemd unit)
 ```
 
+For a settings UI (e.g. the Sound page of RPRice's Settings window):
+
+```
+rp-audio status                         outputs, inputs, app streams, cards (JSON)
+rp-audio input <source>                 default input
+rp-audio source-volume <source> <0-150>
+rp-audio source-mute <source> [toggle|on|off]
+rp-audio stream-volume <id> <0-150>     one app's playback stream
+rp-audio stream-mute <id> [toggle|on|off]
+rp-audio stream-move <id> <sink>        pin an app to another output
+rp-audio rec-move <id> <source>         move a recording stream to another input
+rp-audio profile <card> <profile>       card profile (e.g. headset mic on/off)
+rp-audio port <sink|source> <port>      speakers vs. headphones etc.
+rp-audio blacklist [a,b,…]              print or replace the blacklist
+```
+
 Streams listed in `config/blacklist.conf` are left wherever the app itself
 routed them (e.g. OBS monitoring, EasyEffects).
 
@@ -65,3 +81,6 @@ touched regardless of the blacklist).
 e.g. for [quickshell](https://quickshell.outfoxxed.me/); empty disables it),
 and `SETTLE_SECS` (daemon quarantine window for freshly added outputs). See
 the comments in `config/rp-audio.conf` for defaults.
+
+Set `RP_AUDIO_NO_OSD=1` in the environment of a single call to skip the OSD,
+for a UI that already shows the volume itself (e.g. a slider being dragged).
