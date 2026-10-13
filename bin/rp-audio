@@ -10,7 +10,7 @@
 #   rp-audio list            list outputs (JSON)
 #   rp-audio daemon          watch volume and new streams (systemd unit)
 #
-# For a settings UI:
+# Inputs, app streams and cards:
 #   rp-audio status                    outputs, inputs, app streams, cards (JSON)
 #   rp-audio input <source>            default input
 #   rp-audio source-volume <source> <0-150>
@@ -210,9 +210,9 @@ cmd_list() {
         ]'
 }
 
-# ── Settings page ──────────────────────────────────────────────────────
+# ── inputs, streams and cards ───────────────────────────────────────────
 
-# Everything the Sound page shows, in one JSON (volume = first channel, in %)
+# Outputs, inputs, app streams and cards in one JSON (volume = first channel, in %)
 cmd_status() {
     local sinks sources inputs outputs cards
     sinks=$(pactl -f json list sinks 2>/dev/null || echo '[]')

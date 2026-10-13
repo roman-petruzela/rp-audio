@@ -18,7 +18,7 @@ rp-audio list            list outputs (JSON)
 rp-audio daemon          watch volume and new streams (systemd unit)
 ```
 
-For a settings UI (e.g. a Sound page in a desktop settings window):
+Inputs, app streams and cards:
 
 ```
 rp-audio status                         outputs, inputs, app streams, cards (JSON)
